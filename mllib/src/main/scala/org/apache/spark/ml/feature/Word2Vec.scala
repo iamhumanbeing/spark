@@ -20,6 +20,7 @@ package org.apache.spark.ml.feature
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Since
+import org.apache.spark.internal.config.Kryo.KRYO_SERIALIZER_MAX_BUFFER_SIZE
 import org.apache.spark.ml.{Estimator, Model}
 import org.apache.spark.ml.linalg.{BLAS, Vector, Vectors, VectorUDT}
 import org.apache.spark.ml.param._
@@ -229,7 +230,7 @@ class Word2VecModel private[ml] (
    * Find "num" number of words closest in similarity to the given word, not
    * including the word itself.
    * @return a dataframe with columns "word" and "similarity" of the word and the cosine
-   * similarities between the synonyms and the given word vector.
+   * similarities between the synonyms and the given word.
    */
   @Since("1.5.0")
   def findSynonyms(word: String, num: Int): DataFrame = {
@@ -287,15 +288,16 @@ class Word2VecModel private[ml] (
    */
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
-    transformSchema(dataset.schema, logging = true)
+    val outputSchema = transformSchema(dataset.schema, logging = true)
     val vectors = wordVectors.getVectors
       .mapValues(vv => Vectors.dense(vv.map(_.toDouble)))
       .map(identity) // mapValues doesn't return a serializable map (SI-7005)
     val bVectors = dataset.sparkSession.sparkContext.broadcast(vectors)
     val d = $(vectorSize)
+    val emptyVec = Vectors.sparse(d, Array.emptyIntArray, Array.emptyDoubleArray)
     val word2Vec = udf { sentence: Seq[String] =>
       if (sentence.isEmpty) {
-        Vectors.sparse(d, Array.empty[Int], Array.empty[Double])
+        emptyVec
       } else {
         val sum = Vectors.zeros(d)
         sentence.foreach { word =>
@@ -307,12 +309,18 @@ class Word2VecModel private[ml] (
         sum
       }
     }
-    dataset.withColumn($(outputCol), word2Vec(col($(inputCol))))
+    dataset.withColumn($(outputCol), word2Vec(col($(inputCol))),
+      outputSchema($(outputCol)).metadata)
   }
 
   @Since("1.4.0")
   override def transformSchema(schema: StructType): StructType = {
-    validateAndTransformSchema(schema)
+    var outputSchema = validateAndTransformSchema(schema)
+    if ($(outputCol).nonEmpty) {
+      outputSchema = SchemaUtils.updateAttributeGroupSize(outputSchema,
+        $(outputCol), $(vectorSize))
+    }
+    outputSchema
   }
 
   @Since("1.4.1")
@@ -323,6 +331,12 @@ class Word2VecModel private[ml] (
 
   @Since("1.6.0")
   override def write: MLWriter = new Word2VecModelWriter(this)
+
+  @Since("3.0.0")
+  override def toString: String = {
+    s"Word2VecModel: uid=$uid, numWords=${wordVectors.wordIndex.size}, " +
+      s"vectorSize=${$(vectorSize)}"
+  }
 }
 
 @Since("1.6.0")
@@ -337,14 +351,17 @@ object Word2VecModel extends MLReadable[Word2VecModel] {
       DefaultParamsWriter.saveMetadata(instance, path, sc)
 
       val wordVectors = instance.wordVectors.getVectors
-      val dataSeq = wordVectors.toSeq.map { case (word, vector) => Data(word, vector) }
       val dataPath = new Path(path, "data").toString
       val bufferSizeInBytes = Utils.byteStringAsBytes(
-        sc.conf.get("spark.kryoserializer.buffer.max", "64m"))
+        sc.conf.get(KRYO_SERIALIZER_MAX_BUFFER_SIZE.key, "64m"))
       val numPartitions = Word2VecModelWriter.calculateNumberOfPartitions(
         bufferSizeInBytes, instance.wordVectors.wordIndex.size, instance.getVectorSize)
-      sparkSession.createDataFrame(dataSeq)
+      val spark = sparkSession
+      import spark.implicits._
+      spark.createDataset[(String, Array[Float])](wordVectors.toSeq)
         .repartition(numPartitions)
+        .map { case (word, vector) => Data(word, vector) }
+        .toDF()
         .write
         .parquet(dataPath)
     }
@@ -407,7 +424,7 @@ object Word2VecModel extends MLReadable[Word2VecModel] {
       }
 
       val model = new Word2VecModel(metadata.uid, oldModel)
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      metadata.getAndSetParams(model)
       model
     }
   }
